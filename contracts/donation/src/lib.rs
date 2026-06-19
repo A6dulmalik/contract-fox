@@ -8,6 +8,8 @@ const CAMPAIGN_TOTALS: Symbol = symbol_short!("CMP_TOT");
 const DONOR_HISTORY: Symbol = symbol_short!("DON_HIS");
 const DONATION_COUNT: Symbol = symbol_short!("DON_CNT");
 const CAMPAIGN_CONTRACT_ID: Symbol = symbol_short!("CMP_CID");
+const PAUSED: Symbol = symbol_short!("PAUSED");
+const ADMIN: Symbol = symbol_short!("ADMIN");
 
 // Donation data tuple: (donor, campaign_id, amount, timestamp)
 pub type Donation = (Address, u64, i128, u64);
@@ -37,21 +39,78 @@ pub struct WithdrawalApprovedEvent {
     pub tx_hash: Symbol,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractPausedEvent {
+    pub admin: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractUnpausedEvent {
+    pub admin: Address,
+}
+
+fn require_not_paused(env: &Env) {
+    let paused: bool = env.storage().instance().get(&PAUSED).unwrap_or(false);
+    if paused {
+        panic!("Contract is paused");
+    }
+}
+
 #[contract]
 pub struct DonationContract;
 
 #[contractimpl]
 impl DonationContract {
-    /// Initialize the donation contract with Campaign contract ID
+    /// Initialize the donation contract with Campaign contract ID and admin address
     ///
     /// # Arguments
     /// * `env` - The contract environment
     /// * `campaign_contract_id` - The contract ID of the Campaign contract
-    pub fn initialize(env: Env, campaign_contract_id: Address) {
+    /// * `admin` - The admin allowed to pause/unpause the contract
+    pub fn initialize(env: Env, campaign_contract_id: Address, admin: Address) {
         if env.storage().instance().has(&CAMPAIGN_CONTRACT_ID) {
             panic!("Donation contract instance is already initialized");
         }
         env.storage().instance().set(&CAMPAIGN_CONTRACT_ID, &campaign_contract_id);
+        env.storage().instance().set(&ADMIN, &admin);
+    }
+
+    /// Pause the contract; only the admin can call this
+    pub fn pause(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN)
+            .unwrap_or_else(|| panic!("Contract not initialized"));
+        if admin != stored_admin {
+            panic!("Unauthorized: caller is not admin");
+        }
+        env.storage().instance().set(&PAUSED, &true);
+        env.events().publish(
+            (Symbol::new(&env, "ContractPaused"),),
+            ContractPausedEvent { admin },
+        );
+    }
+
+    /// Unpause the contract; only the admin can call this
+    pub fn unpause(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN)
+            .unwrap_or_else(|| panic!("Contract not initialized"));
+        if admin != stored_admin {
+            panic!("Unauthorized: caller is not admin");
+        }
+        env.storage().instance().set(&PAUSED, &false);
+        env.events().publish(
+            (Symbol::new(&env, "ContractUnpaused"),),
+            ContractUnpausedEvent { admin },
+        );
     }
 
     /// Donate funds to a campaign
@@ -62,6 +121,8 @@ impl DonationContract {
     /// * `campaign_id` - The ID of the campaign to donate to
     /// * `amount` - The amount to donate
     pub fn donate(env: Env, donor: Address, campaign_id: u64, amount: i128) {
+        require_not_paused(&env);
+
         // Require authentication from donor
         donor.require_auth();
 
@@ -147,6 +208,8 @@ impl DonationContract {
 
     /// Hook function for executing withdrawal operations request triggers
     pub fn request_withdrawal(env: Env, campaign_id: u64, withdrawal_id: u64, amount: i128) {
+        require_not_paused(&env);
+
         if amount <= 0 {
             panic!("Withdrawal request amount must be positive");
         }
@@ -163,6 +226,8 @@ impl DonationContract {
 
     /// Hook function for validating completed withdrawal distributions
     pub fn approve_withdrawal(env: Env, withdrawal_id: u64, tx_hash: Symbol) {
+        require_not_paused(&env);
+
         env.events().publish(
             (symbol_short!("with_app"), withdrawal_id),
             WithdrawalApprovedEvent {
@@ -321,9 +386,10 @@ mod test {
         // Deploy Donation contract
         let contract_id = env.register_contract(None, DonationContract);
         let client = DonationContractClient::new(&env, &contract_id);
-        
+
         // Initialize with Campaign contract ID
-        client.initialize(&mock_campaign_id);
+        let admin = Address::generate(&env);
+        client.initialize(&mock_campaign_id, &admin);
 
         let donor = Address::generate(&env);
         let campaign_id = 1u64;
@@ -366,9 +432,10 @@ mod test {
         // Deploy Donation contract
         let contract_id = env.register_contract(None, DonationContract);
         let client = DonationContractClient::new(&env, &contract_id);
-        
+
         // Initialize with Campaign contract ID
-        client.initialize(&mock_campaign_id);
+        let admin = Address::generate(&env);
+        client.initialize(&mock_campaign_id, &admin);
 
         let donor1 = Address::generate(&env);
         let donor2 = Address::generate(&env);
@@ -406,11 +473,12 @@ mod test {
         let mock_campaign_id = env.register_contract(None, MockCampaignContract);
         let contract_id = env.register_contract(None, DonationContract);
         let client = DonationContractClient::new(&env, &contract_id);
-        
-        client.initialize(&mock_campaign_id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&mock_campaign_id, &admin);
         let donor = Address::generate(&env);
         let campaign_id = 1u64;
-        
+
         client.donate(&donor, &campaign_id, &0i128);
     }
 
@@ -423,11 +491,12 @@ mod test {
         let mock_campaign_id = env.register_contract(None, MockCampaignContract);
         let contract_id = env.register_contract(None, DonationContract);
         let client = DonationContractClient::new(&env, &contract_id);
-        
-        client.initialize(&mock_campaign_id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&mock_campaign_id, &admin);
         let donor = Address::generate(&env);
         let campaign_id = 1u64;
-        
+
         client.donate(&donor, &campaign_id, &-100i128);
     }
     
@@ -453,8 +522,47 @@ mod test {
         let mock_campaign_id = env.register_contract(None, MockCampaignContract);
         let contract_id = env.register_contract(None, DonationContract);
         let client = DonationContractClient::new(&env, &contract_id);
-        
-        client.initialize(&mock_campaign_id);
-        client.initialize(&mock_campaign_id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&mock_campaign_id, &admin);
+        client.initialize(&mock_campaign_id, &admin);
+    }
+
+    #[test]
+    #[should_panic(expected = "Contract is paused")]
+    fn test_donate_when_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let mock_campaign_id = env.register_contract(None, MockCampaignContract);
+        let contract_id = env.register_contract(None, DonationContract);
+        let client = DonationContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&mock_campaign_id, &admin);
+        client.pause(&admin);
+
+        let donor = Address::generate(&env);
+        client.donate(&donor, &1u64, &100i128);
+    }
+
+    #[test]
+    fn test_pause_and_unpause() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let mock_campaign_id = env.register_contract(None, MockCampaignContract);
+        let contract_id = env.register_contract(None, DonationContract);
+        let client = DonationContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&mock_campaign_id, &admin);
+
+        client.pause(&admin);
+        client.unpause(&admin);
+
+        let donor = Address::generate(&env);
+        client.donate(&donor, &1u64, &50i128);
+        assert_eq!(client.get_total_raised(&1u64), 50i128);
     }
 }

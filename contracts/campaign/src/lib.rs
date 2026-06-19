@@ -1,10 +1,12 @@
 #![no_std]
 
-use soroban_sdk::{Address, Env, Symbol, Vec, contract, contractimpl, contracttype};
+use soroban_sdk::{Address, Env, Symbol, Vec, contract, contractimpl, contracttype, symbol_short};
 
 const CAMPAIGN_TTL_THRESHOLD_LEDGERS: u32 = 17280 * 7;
 const CAMPAIGN_TTL_BUMP_TO_LEDGERS: u32 = 17280 * 30;
 const CAMPAIGN_TTL_BUMP_LOCK_WINDOW_LEDGERS: u32 = 100;
+const PAUSED: Symbol = symbol_short!("PAUSED");
+const ADMIN: Symbol = symbol_short!("ADMIN");
 
 // Campaign status constants
 pub const CAMPAIGN_STATUS_ACTIVE: u32 = 0;
@@ -83,11 +85,74 @@ pub struct CampaignStatusChangedEvent {
     pub new_status: u32,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractPausedEvent {
+    pub admin: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractUnpausedEvent {
+    pub admin: Address,
+}
+
+fn require_not_paused(env: &Env) {
+    let paused: bool = env.storage().instance().get(&PAUSED).unwrap_or(false);
+    if paused {
+        panic!("Contract is paused");
+    }
+}
+
 #[contract]
 pub struct CampaignContract;
 
 #[contractimpl]
 impl CampaignContract {
+    /// Initialize the contract and set the admin address
+    pub fn initialize(env: Env, admin: Address) {
+        if env.storage().instance().has(&ADMIN) {
+            panic!("Contract is already initialized");
+        }
+        env.storage().instance().set(&ADMIN, &admin);
+    }
+
+    /// Pause the contract; only the admin can call this
+    pub fn pause(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN)
+            .unwrap_or_else(|| panic!("Contract not initialized"));
+        if admin != stored_admin {
+            panic!("Unauthorized: caller is not admin");
+        }
+        env.storage().instance().set(&PAUSED, &true);
+        env.events().publish(
+            (Symbol::new(&env, "ContractPaused"),),
+            ContractPausedEvent { admin },
+        );
+    }
+
+    /// Unpause the contract; only the admin can call this
+    pub fn unpause(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN)
+            .unwrap_or_else(|| panic!("Contract not initialized"));
+        if admin != stored_admin {
+            panic!("Unauthorized: caller is not admin");
+        }
+        env.storage().instance().set(&PAUSED, &false);
+        env.events().publish(
+            (Symbol::new(&env, "ContractUnpaused"),),
+            ContractUnpausedEvent { admin },
+        );
+    }
+
     /// Register a new campaign
     ///
     /// # Arguments
@@ -99,6 +164,7 @@ impl CampaignContract {
     /// # Returns
     /// The ID of newly created campaign
     pub fn register_campaign(env: Env, owner: Address, goal: i128, deadline: u64) -> u64 {
+        require_not_paused(&env);
         owner.require_auth();
 
         // Get current campaign count and increment
@@ -171,6 +237,7 @@ impl CampaignContract {
     /// * `campaign_id` - The ID of campaign to update
     /// * `status` - The new status for campaign
     pub fn update_campaign_status(env: Env, campaign_id: u64, status: u32) {
+        require_not_paused(&env);
         let campaign: Campaign = env
             .storage()
             .persistent()
@@ -262,6 +329,7 @@ impl CampaignContract {
     /// * `campaign_id` - The ID of campaign to update
     /// * `amount` - The amount to add to raised total
     pub fn update_raised_amount(env: Env, campaign_id: u64, amount: i128) {
+        require_not_paused(&env);
         if amount <= 0 {
             panic!("Amount must be positive");
         }
